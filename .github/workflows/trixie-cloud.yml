@@ -45,6 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           uname -a
+          echo "Workspace: $GITHUB_WORKSPACE"
           echo "CPU cores: $(nproc)"
           df -h
 
@@ -72,26 +73,38 @@ jobs:
             python3
           apt-get build-dep -y "$KERNEL_SOURCE_PKG"
 
-      - name: Download Debian linux source
+      - name: Download Debian linux source and detect correct source dir
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
           apt-get source "$KERNEL_SOURCE_PKG"
 
-          SRC_DIR="$(find . -maxdepth 1 -type d -name 'linux-*' | sort | head -n1)"
+          # Pick linux-* dir that actually contains Debian packaging rules
+          SRC_DIR="$(
+            find "$GITHUB_WORKSPACE" -maxdepth 1 -mindepth 1 -type d -name 'linux-*' \
+            | while read -r d; do
+                [[ -f "$d/debian/rules" ]] && echo "$d"
+              done \
+            | head -n1
+          )"
+
           if [[ -z "${SRC_DIR:-}" ]]; then
-            echo "ERROR: linux source directory not found."
+            echo "ERROR: Could not find Debian linux source dir with debian/rules"
+            echo "Candidate linux-* directories:"
+            find "$GITHUB_WORKSPACE" -maxdepth 2 -type d -name 'linux-*' -print
             exit 1
           fi
 
           PKG_DIR="$(dirname "$SRC_DIR")"
-          [[ -d "$PKG_DIR" ]] || PKG_DIR="."
+          [[ -d "$PKG_DIR" ]] || PKG_DIR="$GITHUB_WORKSPACE"
 
           echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
           echo "PKG_DIR=$PKG_DIR" >> "$GITHUB_ENV"
           echo "BUILD_TARGET=unknown" >> "$GITHUB_ENV"
 
-          echo "Source dir: $SRC_DIR"
-          echo "Package output dir: $PKG_DIR"
+          echo "Using SRC_DIR=$SRC_DIR"
+          ls -la "$SRC_DIR/debian" | sed -n '1,120p'
 
       - name: Optional local patch (debian-cloud.patch)
         run: |
@@ -116,11 +129,11 @@ jobs:
 
           cp "$CFG" "$CFG.bak"
 
-          # Remove any lines containing these options:
+          # Remove lines containing:
           # - CONFIG_BBR
           # - CONFIG_HZ_1000
           # - CONFIG_HZ_250
-          # - CONFIG_HZ 250 (space form)
+          # - CONFIG_HZ 250 (space-separated style)
           sed -i -E \
             -e '/CONFIG_BBR/d' \
             -e '/CONFIG_HZ_1000/d' \
@@ -128,20 +141,19 @@ jobs:
             -e '/CONFIG_HZ[[:space:]]+250/d' \
             "$CFG"
 
-          echo "Patched config.sh. Diff:"
+          echo "Patched config.sh diff:"
           diff -u "$CFG.bak" "$CFG" || true
 
       - name: Run config.sh (optional)
         run: |
           set -euo pipefail
-
           if [[ "${{ inputs.run_config_sh }}" != "true" ]]; then
             echo "run_config_sh=false, skipping config.sh"
             exit 0
           fi
 
           if [[ ! -f "$GITHUB_WORKSPACE/config.sh" ]]; then
-            echo "WARNING: run_config_sh=true but config.sh not found at repo root; skipping."
+            echo "WARNING: run_config_sh=true but config.sh not found; skipping."
             exit 0
           fi
 
@@ -154,10 +166,10 @@ jobs:
           set -euo pipefail
           cd "$SRC_DIR"
 
-          # Debian out-of-tree O= builds require clean source tree
+          # Debian O= builds require clean source tree
           make mrproper || true
 
-          # Extra cleanup for leftovers
+          # extra cleanup of common leftovers
           rm -rf \
             debian/build debian/stamps \
             .config .config.old .version .old_version \
@@ -166,8 +178,24 @@ jobs:
             .tmp_versions \
             output signing_key.pem certs/signing_key.pem
 
-          test ! -e .config || (echo "ERROR: .config still exists"; exit 1)
-          test ! -d include/generated || (echo "ERROR: include/generated still exists"; exit 1)
+          # Ensure packaging files still present
+          test -f debian/rules || { echo "ERROR: debian/rules missing after sanitize"; exit 1; }
+          test -f debian/rules.gen || { echo "ERROR: debian/rules.gen missing after sanitize"; exit 1; }
+
+      - name: Verify packaging files before build
+        run: |
+          set -euo pipefail
+          cd "$SRC_DIR"
+          pwd
+          [[ -f debian/rules ]] || {
+            echo "ERROR: debian/rules missing in $SRC_DIR"
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -path '*/debian/rules' -print
+            exit 1
+          }
+          [[ -f debian/rules.gen ]] || {
+            echo "ERROR: debian/rules.gen missing in $SRC_DIR"
+            exit 1
+          }
 
       - name: Build cloud flavor kernel packages
         run: |
@@ -175,7 +203,7 @@ jobs:
           cd "$SRC_DIR"
           export MAKEFLAGS="-j$(nproc)"
 
-          # Regenerate packaging metadata from debian/config/*
+          # regenerate packaging metadata from debian/config/*
           make -f debian/rules source
 
           BUILT=0
@@ -203,7 +231,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
 
-          # Collect cloud flavor artifacts first
+          # Cloud flavor first
           find "$PKG_DIR" -maxdepth 1 -type f \
             \( -name 'linux-image-*cloud*amd64*.deb' \
                -o -name 'linux-headers-*cloud*amd64*.deb' \
@@ -212,7 +240,7 @@ jobs:
                -o -name '*.changes' \) \
             -exec mv -v {} artifacts/ \;
 
-          # Fallback if no cloud deb was produced
+          # Fallback to generic kernel debs
           if ! find artifacts -maxdepth 1 -type f -name '*.deb' | grep -q .; then
             echo "No cloud .deb found; collecting generic kernel .deb files."
             find "$PKG_DIR" -maxdepth 1 -type f \
@@ -222,7 +250,7 @@ jobs:
               -exec mv -v {} artifacts/ \;
           fi
 
-          # Save one generated effective .config (best effort)
+          # Export one generated effective config (best effort)
           find "$SRC_DIR/debian/build" -type f -name '.config' -print -quit | while IFS= read -r cfg; do
             cp "$cfg" "artifacts/config-${GITHUB_RUN_ID}"
           done || true

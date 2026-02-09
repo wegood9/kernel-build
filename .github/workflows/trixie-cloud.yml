@@ -1,104 +1,97 @@
-name: Build Debian Trixie Cloud Kernel
+name: Build Debian Trixie Cloud Kernel (Native)
 
 on:
   workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Kernel Version to build (e.g., 6.12.13)'
+        required: true
+        default: '6.12.13'
   push:
     branches:
       - main
     paths:
       - 'config.sh'
-      - '.github/workflows/debian-trixie-cloud.yml'
+      - '.github/workflows/debian-trixie-cloud-native.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: debian:trixie
     
     env:
       DEBIAN_FRONTEND: noninteractive
+      KERNEL_VERSION: ${{ github.event.inputs.kernel_version || '6.12.13' }}
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository (Get config.sh)
         uses: actions/checkout@v4
 
-      - name: Enable Source Repositories
+      - name: Install Build Dependencies
         run: |
-          # The standard debian docker image has deb-src commented out.
-          # We must enable it to fetch the kernel source.
-          sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
-          cat /etc/apt/sources.list # Verify the change
-
-      - name: Install Dependencies
-        run: |
-          apt-get update
-          # Install build dependencies for the kernel
-          apt-get build-dep -y linux
-          # Install tools needed for the workflow and packaging
-          apt-get install -y build-essential fakeroot libncurses-dev bison flex libssl-dev libelf-dev \
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot libncurses-dev bison flex libssl-dev libelf-dev \
           dwarves git bc rsync wget ca-certificates debhelper python3 kmod cpio \
-          pahole kernel-wedge quilt
+          pahole
 
-      - name: Fetch Debian Trixie Kernel Source
+      - name: Download & Unpack Kernel Source
         run: |
-          echo "Fetching source via apt..."
-          # This downloads the source, unpacks it, and applies Debian patches automatically.
-          # It guarantees you get the exact kernel version intended for Trixie.
-          apt-get source linux
+          echo "Downloading Kernel $KERNEL_VERSION..."
+          # Fetch the specified Mainline kernel version
+          major_version=$(echo $KERNEL_VERSION | cut -d. -f1)
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$KERNEL_VERSION.tar.xz
           
-          # Rename the directory to a generic name for the next steps
-          mv linux-* linux-src
-          ls -lh linux-src
+          echo "Unpacking..."
+          tar -xf linux-$KERNEL_VERSION.tar.xz
+          mv linux-$KERNEL_VERSION linux-src
 
-      - name: Prepare Cloud Configuration
+      - name: Fetch Debian Cloud Configuration
         run: |
           cd linux-src
           
-          # We base our config on the current Debian configuration.
-          # apt-get source usually includes the debian/ folder with configs.
-          # We can grab the amd64 config from the debian build directory or /boot if available.
-          
-          # However, a cleaner start for custom builds is often 'make defconfig' or using the provided debian config.
-          # Debian configs are complex (split into fragments). 
-          # Let's try to generate the standard Debian config first.
-          
-          # If debian/rules exists, we can use it to generate the config, 
-          # BUT simpler is to just fetch the stock config from the repo if 'make olddefconfig' is too basic.
+          echo "Fetching Debian configuration from Salsa (Sid/Trixie)..."
+          # We fetch the config used for 'amd64' from the Debian Sid branch (which tracks Trixie/Unstable)
           wget -O .config https://salsa.debian.org/kernel-team/linux/-/raw/sid/debian/config/amd64/config.amd64_none_amd64
           
-          # Set a custom local version to identify this build
-          scripts/config --set-str LOCALVERSION "-cloud-custom"
+          # Fix common build failures for custom kernels by disabling trusted keys requirements
+          # (These keys only exist on official Debian build servers)
+          scripts/config --disable SYSTEM_TRUSTED_KEYS
+          scripts/config --disable SYSTEM_REVOCATION_KEYS
           
-          # Normalize the config
+          # Set a custom local version tag
+          scripts/config --set-str LOCALVERSION "-trixie-cloud"
+          
+          # update config to new kernel version defaults
           make olddefconfig
 
       - name: Apply Custom Config (config.sh)
         run: |
           cd linux-src
           
-          # Copy config.sh from your repo to the source dir
+          # Copy your config.sh into the source directory
           cp ../config.sh .
           chmod +x config.sh
           
-          echo "Applying config.sh..."
+          echo "Running config.sh..."
           ./config.sh
           
-          # Finalize config again after script changes
+          # Finalize configuration
           make olddefconfig
 
       - name: Build Kernel (Debian Package)
         run: |
           cd linux-src
           
-          # Disable debug info to save massive amounts of time and space (optional but recommended for cloud)
+          # Disable Debug Info to prevent disk space exhaustion on GitHub Runner (Critical for non-container builds)
           scripts/config --disable DEBUG_INFO
           scripts/config --disable DEBUG_INFO_BTF
           scripts/config --enable DEBUG_INFO_NONE
           
-          # Build binary packages (headers and image)
-          # bindeb-pkg is the upstream kernel target that builds .deb packages
-          make -j$(nproc) bindeb-pkg LOCALVERSION=-cloud-custom
+          # Build the .deb packages
+          # -j$(nproc) uses all available CPU cores
+          # bindeb-pkg creates the debian package structure automatically
+          make -j$(nproc) bindeb-pkg LOCALVERSION=-trixie-cloud
 
-          # Move artifacts
+          # Organize artifacts
           mkdir -p ../build-artifacts
           mv ../*.deb ../build-artifacts/
           mv ../*.changes ../build-artifacts/ 2>/dev/null || true
@@ -107,6 +100,6 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: debian-trixie-cloud-kernel
+          name: debian-trixie-cloud-kernel-${{ env.KERNEL_VERSION }}
           path: build-artifacts/*
           compression-level: 0

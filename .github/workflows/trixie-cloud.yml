@@ -1,16 +1,22 @@
-name: Build Debian Trixie Cloud Kernel
+name: Debian Trixie Cloud Kernel
 
 on:
   workflow_dispatch:
     inputs:
       kernel_source_pkg:
-        description: "Debian kernel source package name"
+        description: "Debian source package (default: linux)"
         required: false
         default: "linux"
+      run_config_sh:
+        description: "Apply repo config.sh"
+        required: false
+        default: "true"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     container:
       image: debian:trixie
 
@@ -29,150 +35,111 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare apt sources and install build deps
+      - name: System info
+        run: |
+          set -euo pipefail
+          uname -a
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "CPU cores: $(nproc)"
+          df -h
+
+      - name: Configure apt (enable deb-src)
         run: |
           set -euo pipefail
 
-          # Ensure deb-src is enabled (needed by apt build-dep / apt source)
-          if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
-            sed -i 's/^Types: deb$/Types: deb deb-src/g' /etc/apt/sources.list.d/debian.sources || true
-          fi
+          cat > /etc/apt/sources.list <<'EOF'
+          deb http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
+          deb-src http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
+          deb http://deb.debian.org/debian trixie-updates main contrib non-free-firmware non-free
+          deb-src http://deb.debian.org/debian trixie-updates main contrib non-free-firmware non-free
+          deb http://security.debian.org/debian-security trixie-security main contrib non-free-firmware non-free
+          deb-src http://security.debian.org/debian-security trixie-security main contrib non-free-firmware non-free
+          EOF
 
           apt-get update
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+
           apt-get install -y --no-install-recommends \
             ca-certificates gnupg dirmngr \
-            build-essential fakeroot devscripts equivs \
-            bc bison flex libssl-dev libelf-dev dwarves cpio rsync kmod pkg-config \
-            python3 quilt ccache git wget xz-utils
+            build-essential fakeroot dpkg-dev devscripts equivs \
+            git rsync wget curl xz-utils zstd cpio quilt ccache \
+            bc bison flex libelf-dev libssl-dev libncurses-dev dwarves \
+            python3 patch
 
-          # Pull build dependencies for Debian kernel source package
-          apt-get build-dep -y "${KERNEL_SOURCE_PKG}"
+          apt-get build-dep -y "$KERNEL_SOURCE_PKG"
 
-      - name: Download Debian kernel source
+      - name: Download Debian source (deterministic SRC_DIR)
         run: |
           set -euo pipefail
 
-          # Download source package into workspace
-          apt-get source "${KERNEL_SOURCE_PKG}"
+          SRC_ROOT="$GITHUB_WORKSPACE/_debian_src"
+          rm -rf "$SRC_ROOT"
+          mkdir -p "$SRC_ROOT"
+          cd "$SRC_ROOT"
 
-          SRC_DIR="$(find . -maxdepth 1 -mindepth 1 -type d -name 'linux-*' | sort -V | tail -n1)"
-          [[ -n "${SRC_DIR}" ]] || { echo "ERROR: linux-* source dir not found"; exit 1; }
-          [[ -f "${SRC_DIR}/debian/rules" ]] || { echo "ERROR: debian/rules missing in ${SRC_DIR}"; exit 1; }
+          LOGFILE="$(mktemp)"
+          apt-get source "$KERNEL_SOURCE_PKG" 2>&1 | tee "$LOGFILE"
 
-          echo "SRC_DIR=${SRC_DIR}" >> "${GITHUB_ENV}"
-          echo "PKG_DIR=$(pwd)" >> "${GITHUB_ENV}"
-          echo "Resolved SRC_DIR=${SRC_DIR}"
+          # Parse dpkg-source line: "extracting linux in linux-<ver>"
+          SRC_BASE="$(awk '/dpkg-source: info: extracting .* in / {print $NF}' "$LOGFILE" | tail -n1)"
 
-      - name: Patch config.sh persistently (delete BBR/HZ rules)
-        run: |
-          set -euo pipefail
+          # Fallback parser
+          if [[ -z "${SRC_BASE:-}" ]]; then
+            SRC_BASE="$(find . -maxdepth 1 -mindepth 1 -type d -name 'linux-*' | sed 's#^\./##' | sort -V | tail -n1)"
+          fi
 
-          [[ -f config.sh ]] || { echo "ERROR: config.sh not found at repo root"; exit 1; }
+          [[ -n "${SRC_BASE:-}" ]] || { echo "ERROR: cannot determine source dir"; exit 1; }
 
-          cp -v config.sh config.sh.bak
+          SRC_DIR="$SRC_ROOT/$SRC_BASE"
+          PKG_DIR="$SRC_ROOT"
 
-          # Delete ANY lines containing these exact tokens
-          sed -i -E '/(^|[[:space:]])CONFIG_BBR([[:space:]]|$)/d' config.sh
-          sed -i -E '/(^|[[:space:]])CONFIG_HZ_1000([[:space:]]|$)/d' config.sh
-          sed -i -E '/(^|[[:space:]])CONFIG_HZ_250([[:space:]]|$)/d' config.sh
-
-          chmod +x config.sh
-
-          echo "Sanity check (should print nothing):"
-          grep -nE 'CONFIG_BBR|CONFIG_HZ_1000|CONFIG_HZ_250' config.sh && {
-            echo "ERROR: forbidden tokens still present in config.sh"
+          [[ -d "$SRC_DIR" ]] || { echo "ERROR: source dir not found: $SRC_DIR"; exit 1; }
+          [[ -f "$SRC_DIR/debian/rules" ]] || {
+            echo "ERROR: $SRC_DIR/debian/rules not found right after apt source"
+            echo "Tree under $SRC_ROOT:"
+            find "$SRC_ROOT" -maxdepth 3 -type f -name rules -path '*/debian/*' -print
             exit 1
-          } || true
+          }
 
-          # Use patched config.sh in source tree
-          cp -v config.sh "${SRC_DIR}/config.sh"
-          chmod +x "${SRC_DIR}/config.sh"
+          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
+          echo "PKG_DIR=$PKG_DIR" >> "$GITHUB_ENV"
+          echo "BUILD_TARGET=unknown" >> "$GITHUB_ENV"
 
-      - name: Apply config.sh
+          echo "Resolved SRC_DIR=$SRC_DIR"
+          ls -la "$SRC_DIR/debian" | sed -n '1,120p'
+
+      - name: Optional patch (debian-cloud.patch)
         run: |
           set -euo pipefail
-          cd "${SRC_DIR}"
-          bash ./config.sh
-
-      - name: Clean tree before Debian packaging
-        run: |
-          set -euo pipefail
-          cd "${SRC_DIR}"
-
-          # Avoid "source tree is not clean" failures
-          make mrproper || true
-          fakeroot debian/rules clean || true
-
-      - name: Build cloud kernel (with fallback)
-        run: |
-          set -euo pipefail
-          cd "${SRC_DIR}"
-          export MAKEFLAGS="-j$(nproc)"
-
-          # Regenerate packaging metadata from debian/config/*
-          make -f debian/rules source
-
-          BUILT=0
-          for TARGET in \
-            binary-arch_amd64_none_cloud-amd64 \
-            binary-arch_amd64_none_cloud \
-            binary-arch_amd64_none_amd64
-          do
-            echo "Trying target: ${TARGET}"
-            if make -f debian/rules.gen "${TARGET}"; then
-              BUILT=1
-              echo "BUILD_TARGET=${TARGET}" >> "${GITHUB_ENV}"
-              break
-            fi
-          done
-
-          if [[ "${BUILT}" -ne 1 ]]; then
-            echo "Cloud target not matched; fallback to dpkg-buildpackage -B"
-            dpkg-buildpackage -B -uc -us
-            echo "BUILD_TARGET=dpkg-buildpackage -B" >> "${GITHUB_ENV}"
+          if [[ -f "$GITHUB_WORKSPACE/debian-cloud.patch" ]]; then
+            patch -d "$SRC_DIR" -p1 < "$GITHUB_WORKSPACE/debian-cloud.patch"
+          else
+            echo "No debian-cloud.patch found, skipping."
           fi
 
-      - name: Collect artifacts
+      - name: Patch config.sh (delete BBR/HZ settings)
+        if: ${{ github.event.inputs.run_config_sh == 'true' }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          cd "${PKG_DIR}"
 
-          shopt -s nullglob
+          CFG="$GITHUB_WORKSPACE/config.sh"
+          [[ -f "$CFG" ]] || { echo "ERROR: config.sh not found in repo root"; exit 1; }
 
-          # Preferred: cloud flavor packages
-          for f in \
-            linux-image-*cloud*amd64*.deb \
-            linux-headers-*cloud*amd64*.deb \
-            linux-libc-dev_*amd64*.deb \
-            *.buildinfo \
-            *.changes
-          do
-            [[ -e "$f" ]] && mv -v "$f" artifacts/
-          done
+          cp -f "$CFG" "$CFG.bak"
 
-          # Fallback: generic linux packages
-          if ! compgen -G "artifacts/*.deb" > /dev/null; then
-            echo "No cloud-filtered .deb found; collecting generic linux .deb files."
-            for f in linux-image-*.deb linux-headers-*.deb linux-libc-dev_*.deb; do
-              [[ -e "$f" ]] && mv -v "$f" artifacts/
-            done
-          fi
+          # Delete any line containing these tokens
+          sed -i -E '/(^|[[:space:]])CONFIG_BBR([[:space:]=]|$)/d' "$CFG"
+          sed -i -E '/(^|[[:space:]])CONFIG_HZ_1000([[:space:]=]|$)/d' "$CFG"
+          sed -i -E '/(^|[[:space:]])CONFIG_HZ_250([[:space:]=]|$)/d' "$CFG"
+          sed -i -E '/CONFIG_HZ[[:space:]]+250([[:space:]]|$)/d' "$CFG"
 
-          # Save patched/original config.sh for verification
-          cp -v config.sh artifacts/config.sh.patched
-          [[ -f config.sh.bak ]] && cp -v config.sh.bak artifacts/config.sh.original || true
+          chmod +x "$CFG"
 
-          # Export one generated .config (best effort)
-          find "${SRC_DIR}/debian/build" -type f -name '.config' -print -quit | while read -r cfg; do
-            cp -v "$cfg" "artifacts/config-${GITHUB_RUN_ID}"
-          done || true
+          echo "Patched config.sh diff:"
+          diff -u "$CFG.bak" "$CFG" || true
 
-          ls -lah artifacts
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: debian-trixie-cloud-kernel-${{ github.run_id }}
-          path: artifacts/
-          if-no-files-found: error
+          echo "Sanity check (should be empty):"
+          grep -nE

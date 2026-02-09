@@ -23,6 +23,11 @@ jobs:
     container:
       image: debian:trixie
 
+    # Force bash for all run steps
+    defaults:
+      run:
+        shell: bash
+
     env:
       DEBIAN_FRONTEND: noninteractive
       DEB_BUILD_OPTIONS: nocheck
@@ -36,12 +41,14 @@ jobs:
 
       - name: Show system info
         run: |
+          set -euo pipefail
           uname -a
           echo "CPU cores: $(nproc)"
           df -h
 
       - name: Configure APT sources (enable deb-src)
         run: |
+          set -euo pipefail
           cat > /etc/apt/sources.list <<'EOF'
           deb http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
           deb-src http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
@@ -54,6 +61,7 @@ jobs:
 
       - name: Install build tooling
         run: |
+          set -euo pipefail
           apt-get install -y --no-install-recommends \
             ca-certificates gnupg dirmngr \
             build-essential fakeroot dpkg-dev devscripts equivs \
@@ -65,9 +73,10 @@ jobs:
 
       - name: Download Debian linux source
         run: |
+          set -euo pipefail
           apt-get source linux
           SRC_DIR="$(find . -maxdepth 1 -type d -name 'linux-*' | sort | head -n1)"
-          if [ -z "$SRC_DIR" ]; then
+          if [[ -z "${SRC_DIR:-}" ]]; then
             echo "ERROR: linux source directory not found."
             exit 1
           fi
@@ -76,23 +85,34 @@ jobs:
 
       - name: Optional local patch (if present)
         run: |
-          if [ -f "$GITHUB_WORKSPACE/debian-cloud.patch" ]; then
+          set -euo pipefail
+          if [[ -f "$GITHUB_WORKSPACE/debian-cloud.patch" ]]; then
             echo "Applying debian-cloud.patch"
             patch -d "$SRC_DIR" -p1 < "$GITHUB_WORKSPACE/debian-cloud.patch"
           else
             echo "No debian-cloud.patch found, continue."
           fi
 
+      - name: Apply config.sh
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$GITHUB_WORKSPACE/config.sh" ]]; then
+            echo "ERROR: config.sh not found at repository root."
+            exit 1
+          fi
+          chmod +x "$GITHUB_WORKSPACE/config.sh"
+          cd "$SRC_DIR"
+          bash "$GITHUB_WORKSPACE/config.sh"
+
       - name: Build cloud flavor kernel packages
         run: |
+          set -euo pipefail
           cd "$SRC_DIR"
           export MAKEFLAGS="-j$(nproc)"
 
-          # Prepare generated debian build files
+          # Prepare generated Debian build files
           make -f debian/rules source
 
-          # Try known cloud-target names first (different package revisions can vary)
-          set +e
           BUILT=0
           for TARGET in \
             binary-arch_amd64_none_cloud \
@@ -100,18 +120,15 @@ jobs:
             binary-arch_amd64_none_amd64
           do
             echo "Trying target: $TARGET"
-            make -f debian/rules.gen "$TARGET"
-            RC=$?
-            if [ "$RC" -eq 0 ]; then
+            if make -f debian/rules.gen "$TARGET"; then
               BUILT=1
               echo "BUILD_TARGET=$TARGET" >> "$GITHUB_ENV"
               break
             fi
           done
-          set -e
 
-          # Fallback: architecture-dependent binaries
-          if [ "$BUILT" -ne 1 ]; then
+          # Fallback: build arch-dependent binaries
+          if [[ "$BUILT" -ne 1 ]]; then
             echo "Cloud-only target not matched; fallback to dpkg-buildpackage -B"
             dpkg-buildpackage -B -uc -us
             echo "BUILD_TARGET=dpkg-buildpackage -B" >> "$GITHUB_ENV"
@@ -119,31 +136,35 @@ jobs:
 
       - name: Collect artifacts
         run: |
+          set -euo pipefail
           mkdir -p artifacts
-          shopt -s nullglob
 
-          # Debian builds output packages in parent directory of source tree
-          for f in \
-            linux-image-*cloud*amd64*.deb \
-            linux-headers-*cloud*amd64*.deb \
-            linux-libc-dev_*amd64*.deb \
-            *.buildinfo \
-            *.changes
-          do
-            [ -e "$f" ] && mv -v "$f" artifacts/
-          done
+          # Debian kernel .deb files are usually in parent of source dir
+          PKG_DIR="$(dirname "$SRC_DIR")"
+          [[ -d "$PKG_DIR" ]] || PKG_DIR="."
 
-          # If no cloud-filtered packages found, collect generic kernel debs
-          if ! ls artifacts/*.deb >/dev/null 2>&1; then
+          # Collect cloud flavor first
+          find "$PKG_DIR" -maxdepth 1 -type f \
+            \( -name 'linux-image-*cloud*amd64*.deb' \
+               -o -name 'linux-headers-*cloud*amd64*.deb' \
+               -o -name 'linux-libc-dev_*amd64*.deb' \
+               -o -name '*.buildinfo' \
+               -o -name '*.changes' \) \
+            -exec mv -v {} artifacts/ \;
+
+          # Fallback to generic kernel debs if no cloud deb collected
+          if ! find artifacts -maxdepth 1 -type f -name '*.deb' | grep -q .; then
             echo "No cloud-filtered .deb found; collecting generic linux .deb files."
-            for f in linux-image-*.deb linux-headers-*.deb linux-libc-dev_*.deb; do
-              [ -e "$f" ] && mv -v "$f" artifacts/
-            done
+            find "$PKG_DIR" -maxdepth 1 -type f \
+              \( -name 'linux-image-*.deb' \
+                 -o -name 'linux-headers-*.deb' \
+                 -o -name 'linux-libc-dev_*.deb' \) \
+              -exec mv -v {} artifacts/ \;
           fi
 
           # Export one generated config (best effort)
-          find "$SRC_DIR/debian/build" -type f -name '.config' -print -quit | while read -r cfg; do
-            cp "$cfg" "artifacts/config-${{ github.run_id }}"
+          find "$SRC_DIR/debian/build" -type f -name '.config' -print -quit | while IFS= read -r cfg; do
+            cp "$cfg" "artifacts/config-${GITHUB_RUN_ID}"
           done || true
 
           ls -lah artifacts

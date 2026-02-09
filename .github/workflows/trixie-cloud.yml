@@ -15,10 +15,6 @@ on:
         description: "Run repo root config.sh before build"
         required: false
         default: "true"
-      config_fragment_path:
-        description: "Persistent config fragment (repo-relative or absolute)"
-        required: false
-        default: "debian-trixie-cloud.cfg"
 
 jobs:
   build:
@@ -107,6 +103,34 @@ jobs:
             echo "No debian-cloud.patch found, continue."
           fi
 
+      - name: Patch config.sh (remove BBR/HZ settings)
+        if: ${{ inputs.run_config_sh == 'true' }}
+        run: |
+          set -euo pipefail
+          CFG="$GITHUB_WORKSPACE/config.sh"
+
+          if [[ ! -f "$CFG" ]]; then
+            echo "WARNING: config.sh not found at repo root; nothing to patch."
+            exit 0
+          fi
+
+          cp "$CFG" "$CFG.bak"
+
+          # Remove any lines containing these options:
+          # - CONFIG_BBR
+          # - CONFIG_HZ_1000
+          # - CONFIG_HZ_250
+          # - CONFIG_HZ 250 (space form)
+          sed -i -E \
+            -e '/CONFIG_BBR/d' \
+            -e '/CONFIG_HZ_1000/d' \
+            -e '/CONFIG_HZ_250/d' \
+            -e '/CONFIG_HZ[[:space:]]+250/d' \
+            "$CFG"
+
+          echo "Patched config.sh. Diff:"
+          diff -u "$CFG.bak" "$CFG" || true
+
       - name: Run config.sh (optional)
         run: |
           set -euo pipefail
@@ -130,10 +154,10 @@ jobs:
           set -euo pipefail
           cd "$SRC_DIR"
 
-          # Fix: Debian out-of-tree build requires clean source tree
+          # Debian out-of-tree O= builds require clean source tree
           make mrproper || true
 
-          # extra cleanup for leftovers
+          # Extra cleanup for leftovers
           rm -rf \
             debian/build debian/stamps \
             .config .config.old .version .old_version \
@@ -144,151 +168,6 @@ jobs:
 
           test ! -e .config || (echo "ERROR: .config still exists"; exit 1)
           test ! -d include/generated || (echo "ERROR: include/generated still exists"; exit 1)
-
-      - name: Apply persistent Debian config fragment
-        run: |
-          set -euo pipefail
-          cd "$SRC_DIR"
-
-          FRAG_INPUT="${{ inputs.config_fragment_path }}"
-          if [[ "$FRAG_INPUT" = /* ]]; then
-            FRAG="$FRAG_INPUT"
-          else
-            FRAG="$GITHUB_WORKSPACE/$FRAG_INPUT"
-          fi
-
-          # Auto-create default fragment if missing
-          if [[ ! -f "$FRAG" ]]; then
-            echo "WARN: config fragment not found at $FRAG"
-            FRAG="/tmp/debian-trixie-cloud.cfg"
-            cat > "$FRAG" <<'EOF'
-# Auto-generated default fragment
-CONFIG_BBR=y
-CONFIG_HZ_1000=y
-# CONFIG_DEBUG_INFO is not set
-EOF
-            echo "Using auto-generated fragment: $FRAG"
-          fi
-
-          python3 - "$FRAG" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          frag_path = Path(sys.argv[1])
-          root = Path(".")
-
-          # -------- parse fragment --------
-          raw_lines = frag_path.read_text(encoding="utf-8").splitlines()
-          normalized = []
-          order = []
-
-          for raw in raw_lines:
-              s = raw.strip()
-              if not s:
-                  continue
-
-              m_set = re.match(r'^(CONFIG_[A-Za-z0-9_]+)=(.*)$', s)
-              if m_set:
-                  k, v = m_set.group(1), m_set.group(2)
-                  normalized.append((k, f"{k}={v}"))
-                  order.append(k)
-                  continue
-
-              m_unset = re.match(r'^#\s*(CONFIG_[A-Za-z0-9_]+)\s+is not set$', s)
-              if m_unset:
-                  k = m_unset.group(1)
-                  normalized.append((k, f"# {k} is not set"))
-                  order.append(k)
-                  continue
-
-              if s.startswith("#"):
-                  continue
-
-              raise SystemExit(f"Invalid fragment line: {raw!r}")
-
-          if not normalized:
-              raise SystemExit("No valid CONFIG lines found in fragment.")
-
-          # de-dup by key, keep first appearance order
-          seen = set()
-          final_items = []
-          for k, line in normalized:
-              if k in seen:
-                  continue
-              seen.add(k)
-              final_items.append((k, line))
-
-          keys = [k for k, _ in final_items]
-
-          # -------- discover target config files --------
-          targets = []
-
-          # Always include base amd64 config if exists
-          base = root / "debian/config/amd64/config"
-          if base.exists():
-              targets.append(base)
-
-          # Include any amd64 cloud-related config files
-          for p in sorted((root / "debian/config").rglob("config")):
-              sp = str(p).lower()
-              if "amd64" in sp and "cloud" in sp and p not in targets:
-                  targets.append(p)
-
-          if not targets:
-              raise SystemExit("No Debian config targets found (expected debian/config/amd64/config).")
-
-          begin = "# --- BEGIN CI PERSISTENT FRAGMENT ---"
-          end = "# --- END CI PERSISTENT FRAGMENT ---"
-
-          # regex for removing existing key assignments
-          key_patterns = []
-          for k in keys:
-              key_patterns.append(re.compile(rf'^{re.escape(k)}='))
-              key_patterns.append(re.compile(rf'^#\s*{re.escape(k)}\s+is not set$'))
-
-          def strip_old_block(lines):
-              out = []
-              inside = False
-              for line in lines:
-                  s = line.strip()
-                  if s == begin:
-                      inside = True
-                      continue
-                  if s == end:
-                      inside = False
-                      continue
-                  if not inside:
-                      out.append(line)
-              return out
-
-          for t in targets:
-              lines = t.read_text(encoding="utf-8").splitlines()
-              lines = strip_old_block(lines)
-
-              out = []
-              for line in lines:
-                  s = line.strip()
-                  if any(pat.match(s) for pat in key_patterns):
-                      continue
-                  out.append(line)
-
-              out.append("")
-              out.append(begin)
-              for _, line in final_items:
-                  out.append(line)
-              out.append(end)
-              out.append("")
-
-              t.write_text("\n".join(out), encoding="utf-8")
-              print(f"Applied {len(final_items)} entries to {t}")
-
-          print(f"Fragment source: {frag_path}")
-          PY
-
-          echo "------ Effective fragment ------"
-          cat "$FRAG"
-          echo "--------------------------------"
 
       - name: Build cloud flavor kernel packages
         run: |
@@ -324,6 +203,7 @@ EOF
           set -euo pipefail
           mkdir -p artifacts
 
+          # Collect cloud flavor artifacts first
           find "$PKG_DIR" -maxdepth 1 -type f \
             \( -name 'linux-image-*cloud*amd64*.deb' \
                -o -name 'linux-headers-*cloud*amd64*.deb' \
@@ -332,6 +212,7 @@ EOF
                -o -name '*.changes' \) \
             -exec mv -v {} artifacts/ \;
 
+          # Fallback if no cloud deb was produced
           if ! find artifacts -maxdepth 1 -type f -name '*.deb' | grep -q .; then
             echo "No cloud .deb found; collecting generic kernel .deb files."
             find "$PKG_DIR" -maxdepth 1 -type f \

@@ -1,105 +1,107 @@
-name: Build Debian Trixie Cloud Kernel (Native)
+name: Build Debian Trixie Cloud Kernel
 
 on:
   workflow_dispatch:
-    inputs:
-      kernel_version:
-        description: 'Kernel Version to build (e.g., 6.12.13)'
-        required: true
-        default: '6.12.13'
   push:
-    branches:
-      - main
     paths:
-      - 'config.sh'
-      - '.github/workflows/debian-trixie-cloud-native.yml'
+      - ".github/workflows/build-debian-trixie-cloud.yml"
+      - "config.sh"
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      KERNEL_VERSION: ${{ github.event.inputs.kernel_version || '6.12.13' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout Repository (Get config.sh)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Build Dependencies
+      - name: Free disk space
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot libncurses-dev bison flex libssl-dev libelf-dev \
-          dwarves git bc rsync wget ca-certificates debhelper python3 kmod cpio \
-          pahole
+          set -eux
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          docker system prune -af || true
+          df -h
 
-      - name: Download & Unpack Kernel Source
+      - name: Build Debian trixie cloud kernel in container
         run: |
-          echo "Downloading Kernel $KERNEL_VERSION..."
-          # Fetch the specified Mainline kernel version
-          major_version=$(echo $KERNEL_VERSION | cut -d. -f1)
-          wget -q https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$KERNEL_VERSION.tar.xz
-          
-          echo "Unpacking..."
-          tar -xf linux-$KERNEL_VERSION.tar.xz
-          mv linux-$KERNEL_VERSION linux-src
-
-      - name: Fetch Debian Cloud Configuration
-        run: |
-          cd linux-src
-          
-          echo "Fetching Debian configuration from Salsa (Sid/Trixie)..."
-          # We fetch the config used for 'amd64' from the Debian Sid branch (which tracks Trixie/Unstable)
-          wget -O .config https://salsa.debian.org/kernel-team/linux/-/raw/sid/debian/config/amd64/config.amd64_none_amd64
-          
-          # Fix common build failures for custom kernels by disabling trusted keys requirements
-          # (These keys only exist on official Debian build servers)
-          scripts/config --disable SYSTEM_TRUSTED_KEYS
-          scripts/config --disable SYSTEM_REVOCATION_KEYS
-          
-          # Set a custom local version tag
-          scripts/config --set-str LOCALVERSION "-trixie-cloud"
-          
-          # update config to new kernel version defaults
-          make olddefconfig
-
-      - name: Apply Custom Config (config.sh)
-        run: |
-          cd linux-src
-          
-          # Copy your config.sh into the source directory
-          cp ../config.sh .
+          set -euxo pipefail
           chmod +x config.sh
-          
-          echo "Running config.sh..."
-          ./config.sh
-          
-          # Finalize configuration
-          make olddefconfig
 
-      - name: Build Kernel (Debian Package)
-        run: |
-          cd linux-src
-          
-          # Disable Debug Info to prevent disk space exhaustion on GitHub Runner (Critical for non-container builds)
-          scripts/config --disable DEBUG_INFO
-          scripts/config --disable DEBUG_INFO_BTF
-          scripts/config --enable DEBUG_INFO_NONE
-          
-          # Build the .deb packages
-          # -j$(nproc) uses all available CPU cores
-          # bindeb-pkg creates the debian package structure automatically
-          make -j$(nproc) bindeb-pkg LOCALVERSION=-trixie-cloud
+          docker run --rm \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            debian:trixie \
+            bash -euxo pipefail -c '
+              # Ensure official Debian trixie repos (binary + source)
+              cat > /etc/apt/sources.list <<EOF
+              deb http://deb.debian.org/debian trixie main
+              deb-src http://deb.debian.org/debian trixie main
+              EOF
 
-          # Organize artifacts
-          mkdir -p ../build-artifacts
-          mv ../*.deb ../build-artifacts/
-          mv ../*.changes ../build-artifacts/ 2>/dev/null || true
-          mv ../*.buildinfo ../build-artifacts/ 2>/dev/null || true
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                ca-certificates \
+                build-essential fakeroot devscripts dpkg-dev \
+                bc bison flex kmod cpio rsync file git \
+                xz-utils zstd quilt python3 \
+                libelf-dev libssl-dev libncurses-dev dwarves
 
-      - name: Upload Artifacts
+              # Install Debian kernel build dependencies and fetch official Debian source
+              apt-get build-dep -y linux
+              apt-get source linux
+
+              SRC_DIR="$(find . -maxdepth 1 -type d -name "linux-*" | sort | head -n1)"
+              test -n "$SRC_DIR"
+              cd "$SRC_DIR"
+
+              export DEB_RULES_REQUIRES_ROOT=no
+              export DEB_BUILD_PROFILES="pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo"
+              export MAKEFLAGS="-j$(nproc)"
+
+              ARCH=amd64
+              FEATURESET=none
+              FLAVOUR=cloud
+              SETUP_TARGET="setup_${ARCH}_${FEATURESET}_${FLAVOUR}"
+              BUILD_TARGET="binary-arch_${ARCH}_${FEATURESET}_${FLAVOUR}"
+              BUILD_DIR="debian/build/build_${ARCH}_${FEATURESET}_${FLAVOUR}"
+
+              # Prepare Debian patched source and cloud flavour config
+              debian/rules source
+              make -f debian/rules.gen "${SETUP_TARGET}"
+
+              # Apply your repo config.sh exactly like the original repo flow idea
+              cp "${BUILD_DIR}/.config" .config
+              bash /work/config.sh
+              cp .config "${BUILD_DIR}/.config"
+
+              # Resolve any new symbols after config tweaks
+              make O="${BUILD_DIR}" olddefconfig
+
+              # Build only cloud flavour packages
+              make -f debian/rules.gen "${BUILD_TARGET}"
+
+              # Optional: build indep common headers package (ignore failure if not needed)
+              make -f debian/rules.gen binary-indep_none || true
+
+              # Copy outputs back to workspace root
+              cp -vf ../*.deb /work/ || true
+              cp -vf ../*.changes /work/ || true
+              cp -vf ../*.buildinfo /work/ || true
+            '
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: debian-trixie-cloud-kernel-${{ env.KERNEL_VERSION }}
-          path: build-artifacts/*
-          compression-level: 0
+          name: debian-trixie-cloud-kernel
+          path: |
+            *.deb
+            *.changes
+            *.buildinfo
+            linux-*/debian/build/build_amd64_none_cloud/.config
+          if-no-files-found: warn

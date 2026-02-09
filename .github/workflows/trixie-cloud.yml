@@ -1,145 +1,95 @@
-name: Debian Trixie Cloud Kernel
+name: Build Debian Trixie Cloud Kernel
 
 on:
   workflow_dispatch:
-    inputs:
-      kernel_source_pkg:
-        description: "Debian source package (default: linux)"
-        required: false
-        default: "linux"
-      run_config_sh:
-        description: "Apply repo config.sh"
-        required: false
-        default: "true"
+  push:
+    branches:
+      - main
+    paths:
+      - 'config.sh'
+      - '.github/workflows/debian-trixie-cloud.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    container:
-      image: debian:trixie
-
-    defaults:
-      run:
-        shell: bash
-
+    container: debian:trixie  # Use Trixie container to ensure correct build environment
+    
     env:
       DEBIAN_FRONTEND: noninteractive
-      DEB_BUILD_OPTIONS: nocheck
-      DEB_BUILD_PROFILES: pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo
-      DEB_RULES_REQUIRES_ROOT: "no"
-      KERNEL_SOURCE_PKG: ${{ github.event.inputs.kernel_source_pkg || 'linux' }}
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: System info
+      - name: Install Dependencies
         run: |
-          set -euo pipefail
-          uname -a
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "CPU cores: $(nproc)"
-          df -h
-
-      - name: Configure apt (enable deb-src)
-        run: |
-          set -euo pipefail
-
-          cat > /etc/apt/sources.list <<'EOF'
-          deb http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
-          deb-src http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
-          deb http://deb.debian.org/debian trixie-updates main contrib non-free-firmware non-free
-          deb-src http://deb.debian.org/debian trixie-updates main contrib non-free-firmware non-free
-          deb http://security.debian.org/debian-security trixie-security main contrib non-free-firmware non-free
-          deb-src http://security.debian.org/debian-security trixie-security main contrib non-free-firmware non-free
-          EOF
-
           apt-get update
+          apt-get install -y build-essential fakeroot libncurses-dev bison flex libssl-dev libelf-dev \
+          dwarves git bc rsync wget ca-certificates debhelper python3 kmod cpio \
+          pahole kernel-wedge
+          
+          # Install dependencies specifically for Debian kernel packaging
+          apt-get install -y linux-source
 
-      - name: Install build dependencies
+      - name: Fetch Debian Trixie Kernel Source
         run: |
-          set -euo pipefail
+          echo "Cloning Debian Kernel Team source..."
+          # Clone the specific branch for Trixie (usually master or a specific codename branch)
+          git clone --depth=1 https://salsa.debian.org/kernel-team/linux.git -b master linux-src
+          
+          # Alternatively, if you want the exact upstream stable version used in Trixie:
+          # wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+          # tar -xf linux-6.12.tar.xz
+          # mv linux-6.12 linux-src
 
-          apt-get install -y --no-install-recommends \
-            ca-certificates gnupg dirmngr \
-            build-essential fakeroot dpkg-dev devscripts equivs \
-            git rsync wget curl xz-utils zstd cpio quilt ccache \
-            bc bison flex libelf-dev libssl-dev libncurses-dev dwarves \
-            python3 patch
-
-          apt-get build-dep -y "$KERNEL_SOURCE_PKG"
-
-      - name: Download Debian source (deterministic SRC_DIR)
+      - name: Prepare Cloud Configuration
         run: |
-          set -euo pipefail
+          cd linux-src
+          
+          # Method 1: Fetch config from Debian Salsa (Official Config)
+          # Debian cloud kernels are typically standard configs with specific modules enabled/disabled
+          # We grab the 'amd64' config. In Debian, 'cloud' is often a flavor of the main image 
+          # or handled via specific fragments. Here we use the standard amd64 config as base.
+          wget -O .config https://salsa.debian.org/kernel-team/linux/-/raw/master/debian/config/amd64/config.amd64_none_amd64
+          
+          # Explicitly set it to cloud-localversion to distinguish it
+          scripts/config --set-str LOCALVERSION "-cloud-custom"
+          
+          # Ensure we have a valid config before customization
+          make olddefconfig
 
-          SRC_ROOT="$GITHUB_WORKSPACE/_debian_src"
-          rm -rf "$SRC_ROOT"
-          mkdir -p "$SRC_ROOT"
-          cd "$SRC_ROOT"
-
-          LOGFILE="$(mktemp)"
-          apt-get source "$KERNEL_SOURCE_PKG" 2>&1 | tee "$LOGFILE"
-
-          # Parse dpkg-source line: "extracting linux in linux-<ver>"
-          SRC_BASE="$(awk '/dpkg-source: info: extracting .* in / {print $NF}' "$LOGFILE" | tail -n1)"
-
-          # Fallback parser
-          if [[ -z "${SRC_BASE:-}" ]]; then
-            SRC_BASE="$(find . -maxdepth 1 -mindepth 1 -type d -name 'linux-*' | sed 's#^\./##' | sort -V | tail -n1)"
-          fi
-
-          [[ -n "${SRC_BASE:-}" ]] || { echo "ERROR: cannot determine source dir"; exit 1; }
-
-          SRC_DIR="$SRC_ROOT/$SRC_BASE"
-          PKG_DIR="$SRC_ROOT"
-
-          [[ -d "$SRC_DIR" ]] || { echo "ERROR: source dir not found: $SRC_DIR"; exit 1; }
-          [[ -f "$SRC_DIR/debian/rules" ]] || {
-            echo "ERROR: $SRC_DIR/debian/rules not found right after apt source"
-            echo "Tree under $SRC_ROOT:"
-            find "$SRC_ROOT" -maxdepth 3 -type f -name rules -path '*/debian/*' -print
-            exit 1
-          }
-
-          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
-          echo "PKG_DIR=$PKG_DIR" >> "$GITHUB_ENV"
-          echo "BUILD_TARGET=unknown" >> "$GITHUB_ENV"
-
-          echo "Resolved SRC_DIR=$SRC_DIR"
-          ls -la "$SRC_DIR/debian" | sed -n '1,120p'
-
-      - name: Optional patch (debian-cloud.patch)
+      - name: Apply Custom Config (config.sh)
         run: |
-          set -euo pipefail
-          if [[ -f "$GITHUB_WORKSPACE/debian-cloud.patch" ]]; then
-            patch -d "$SRC_DIR" -p1 < "$GITHUB_WORKSPACE/debian-cloud.patch"
-          else
-            echo "No debian-cloud.patch found, skipping."
-          fi
+          cd linux-src
+          
+          # Copy config.sh from the checkout to the source dir
+          cp ../config.sh .
+          chmod +x config.sh
+          
+          echo "Applying config.sh..."
+          ./config.sh
+          
+          # Finalize config
+          make olddefconfig
 
-      - name: Patch config.sh (delete BBR/HZ settings)
-        if: ${{ github.event.inputs.run_config_sh == 'true' }}
+      - name: Build Kernel (Debian Package)
         run: |
-          set -euo pipefail
+          cd linux-src
+          
+          # Build binary packages (headers and image)
+          # -j$(nproc) uses all available cores
+          # bindeb-pkg builds the source and binary .deb packages
+          make -j$(nproc) bindeb-pkg LOCALVERSION=-cloud-custom KDEB_PKGVERSION=$(make kernelversion)-1
 
-          CFG="$GITHUB_WORKSPACE/config.sh"
-          [[ -f "$CFG" ]] || { echo "ERROR: config.sh not found in repo root"; exit 1; }
+          # Move artifacts to a clean directory for upload
+          mkdir -p ../build-artifacts
+          mv ../*.deb ../build-artifacts/
+          mv ../*.changes ../build-artifacts/ 2>/dev/null || true
+          mv ../*.buildinfo ../build-artifacts/ 2>/dev/null || true
 
-          cp -f "$CFG" "$CFG.bak"
-
-          # Delete any line containing these tokens
-          sed -i -E '/(^|[[:space:]])CONFIG_BBR([[:space:]=]|$)/d' "$CFG"
-          sed -i -E '/(^|[[:space:]])CONFIG_HZ_1000([[:space:]=]|$)/d' "$CFG"
-          sed -i -E '/(^|[[:space:]])CONFIG_HZ_250([[:space:]=]|$)/d' "$CFG"
-          sed -i -E '/CONFIG_HZ[[:space:]]+250([[:space:]]|$)/d' "$CFG"
-
-          chmod +x "$CFG"
-
-          echo "Patched config.sh diff:"
-          diff -u "$CFG.bak" "$CFG" || true
-
-          echo "Sanity check (should be empty):"
-          grep -nE
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-trixie-cloud-kernel
+          path: build-artifacts/*
+          compression-level: 0 # Faster upload since .deb is already compressed

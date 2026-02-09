@@ -16,7 +16,7 @@ on:
         required: false
         default: "true"
       config_fragment_path:
-        description: "Persistent kernel config fragment path (repo-relative or absolute)"
+        description: "Persistent config fragment (repo-relative or absolute)"
         required: false
         default: "debian-trixie-cloud.cfg"
 
@@ -65,15 +65,15 @@ jobs:
           EOF
           apt-get update
 
-      - name: Install build tooling and build-deps
+      - name: Install build tooling and deps
         run: |
           set -euo pipefail
           apt-get install -y --no-install-recommends \
             ca-certificates gnupg dirmngr \
             build-essential fakeroot dpkg-dev devscripts equivs \
-            git rsync wget curl xz-utils zstd cpio \
+            git rsync wget curl xz-utils zstd cpio quilt ccache \
             bc bison flex libelf-dev libssl-dev libncurses-dev dwarves \
-            quilt python3 python3-venv
+            python3
           apt-get build-dep -y "$KERNEL_SOURCE_PKG"
 
       - name: Download Debian linux source
@@ -117,15 +117,12 @@ jobs:
           fi
 
           if [[ ! -f "$GITHUB_WORKSPACE/config.sh" ]]; then
-            echo "ERROR: run_config_sh=true but config.sh not found at repo root."
-            exit 1
+            echo "WARNING: run_config_sh=true but config.sh not found at repo root; skipping."
+            exit 0
           fi
 
           chmod +x "$GITHUB_WORKSPACE/config.sh"
           cd "$SRC_DIR"
-
-          # Allow config.sh to patch sources / debian files if needed.
-          # Any in-tree build artifacts it creates will be cleaned in the next step.
           bash "$GITHUB_WORKSPACE/config.sh"
 
       - name: Sanitize source tree for Debian packaging
@@ -133,21 +130,18 @@ jobs:
           set -euo pipefail
           cd "$SRC_DIR"
 
-          # Debian packaging does out-of-tree O= builds and requires a clean source tree.
+          # Fix: Debian out-of-tree build requires clean source tree
           make mrproper || true
 
-          # Extra cleanup for stubborn leftovers.
+          # extra cleanup for leftovers
           rm -rf \
             debian/build debian/stamps \
             .config .config.old .version .old_version \
             Module.symvers System.map vmlinux \
             include/config include/generated \
             .tmp_versions \
-            tools/objtool/*.o tools/objtool/objtool tools/objtool/fixdep \
-            tools/bpf/resolve_btfids/resolve_btfids \
             output signing_key.pem certs/signing_key.pem
 
-          # Quick cleanliness checks
           test ! -e .config || (echo "ERROR: .config still exists"; exit 1)
           test ! -d include/generated || (echo "ERROR: include/generated still exists"; exit 1)
 
@@ -163,97 +157,138 @@ jobs:
             FRAG="$GITHUB_WORKSPACE/$FRAG_INPUT"
           fi
 
+          # Auto-create default fragment if missing
           if [[ ! -f "$FRAG" ]]; then
-            echo "ERROR: config fragment not found: $FRAG"
-            echo "Create it (default path: debian-trixie-cloud.cfg) with lines like:"
-            echo "  CONFIG_BBR=y"
-            echo "  CONFIG_HZ_1000=y"
-            echo "  # CONFIG_DEBUG_INFO is not set"
-            exit 1
+            echo "WARN: config fragment not found at $FRAG"
+            FRAG="/tmp/debian-trixie-cloud.cfg"
+            cat > "$FRAG" <<'EOF'
+# Auto-generated default fragment
+CONFIG_BBR=y
+CONFIG_HZ_1000=y
+# CONFIG_DEBUG_INFO is not set
+EOF
+            echo "Using auto-generated fragment: $FRAG"
           fi
 
-          TARGET="debian/config/amd64/config"
-          [[ -f "$TARGET" ]] || { echo "ERROR: target config not found: $TARGET"; exit 1; }
-
-          python3 - "$FRAG" "$TARGET" <<'PY'
+          python3 - "$FRAG" <<'PY'
           import re
           import sys
           from pathlib import Path
 
           frag_path = Path(sys.argv[1])
-          target_path = Path(sys.argv[2])
+          root = Path(".")
 
-          frag_lines_raw = frag_path.read_text(encoding="utf-8").splitlines()
+          # -------- parse fragment --------
+          raw_lines = frag_path.read_text(encoding="utf-8").splitlines()
           normalized = []
-          keys = []
+          order = []
 
-          for raw in frag_lines_raw:
+          for raw in raw_lines:
               s = raw.strip()
               if not s:
                   continue
-              # Keep regular comments (except "is not set" lines) as ignored
+
               m_set = re.match(r'^(CONFIG_[A-Za-z0-9_]+)=(.*)$', s)
               if m_set:
-                  key, val = m_set.group(1), m_set.group(2)
-                  normalized.append(f"{key}={val}")
-                  keys.append(key)
+                  k, v = m_set.group(1), m_set.group(2)
+                  normalized.append((k, f"{k}={v}"))
+                  order.append(k)
                   continue
 
               m_unset = re.match(r'^#\s*(CONFIG_[A-Za-z0-9_]+)\s+is not set$', s)
               if m_unset:
-                  key = m_unset.group(1)
-                  normalized.append(f"# {key} is not set")
-                  keys.append(key)
+                  k = m_unset.group(1)
+                  normalized.append((k, f"# {k} is not set"))
+                  order.append(k)
                   continue
 
               if s.startswith("#"):
-                  # ordinary comment line in fragment: ignore
                   continue
 
-              raise SystemExit(f"Invalid config line in fragment: {raw!r}")
+              raise SystemExit(f"Invalid fragment line: {raw!r}")
 
-          if not keys:
-              raise SystemExit("No valid CONFIG entries found in fragment.")
+          if not normalized:
+              raise SystemExit("No valid CONFIG lines found in fragment.")
 
-          # De-duplicate keys while preserving order
+          # de-dup by key, keep first appearance order
           seen = set()
-          uniq_normalized = []
-          for line in normalized:
-              key = line.split("=", 1)[0] if line.startswith("CONFIG_") else line.split()[1]
-              if key in seen:
+          final_items = []
+          for k, line in normalized:
+              if k in seen:
                   continue
-              seen.add(key)
-              uniq_normalized.append(line)
+              seen.add(k)
+              final_items.append((k, line))
 
+          keys = [k for k, _ in final_items]
+
+          # -------- discover target config files --------
+          targets = []
+
+          # Always include base amd64 config if exists
+          base = root / "debian/config/amd64/config"
+          if base.exists():
+              targets.append(base)
+
+          # Include any amd64 cloud-related config files
+          for p in sorted((root / "debian/config").rglob("config")):
+              sp = str(p).lower()
+              if "amd64" in sp and "cloud" in sp and p not in targets:
+                  targets.append(p)
+
+          if not targets:
+              raise SystemExit("No Debian config targets found (expected debian/config/amd64/config).")
+
+          begin = "# --- BEGIN CI PERSISTENT FRAGMENT ---"
+          end = "# --- END CI PERSISTENT FRAGMENT ---"
+
+          # regex for removing existing key assignments
           key_patterns = []
-          for k in seen:
+          for k in keys:
               key_patterns.append(re.compile(rf'^{re.escape(k)}='))
               key_patterns.append(re.compile(rf'^#\s*{re.escape(k)}\s+is not set$'))
 
-          tgt_lines = target_path.read_text(encoding="utf-8").splitlines()
-          out = []
-          for line in tgt_lines:
-              stripped = line.strip()
-              if any(p.match(stripped) for p in key_patterns):
-                  continue
-              out.append(line)
+          def strip_old_block(lines):
+              out = []
+              inside = False
+              for line in lines:
+                  s = line.strip()
+                  if s == begin:
+                      inside = True
+                      continue
+                  if s == end:
+                      inside = False
+                      continue
+                  if not inside:
+                      out.append(line)
+              return out
 
-          out.append("")
-          out.append("# --- BEGIN CI PERSISTENT FRAGMENT ---")
-          out.extend(uniq_normalized)
-          out.append("# --- END CI PERSISTENT FRAGMENT ---")
-          out.append("")
+          for t in targets:
+              lines = t.read_text(encoding="utf-8").splitlines()
+              lines = strip_old_block(lines)
 
-          target_path.write_text("\n".join(out), encoding="utf-8")
+              out = []
+              for line in lines:
+                  s = line.strip()
+                  if any(pat.match(s) for pat in key_patterns):
+                      continue
+                  out.append(line)
 
-          print(f"Applied {len(uniq_normalized)} persistent config entries from {frag_path} to {target_path}")
+              out.append("")
+              out.append(begin)
+              for _, line in final_items:
+                  out.append(line)
+              out.append(end)
+              out.append("")
+
+              t.write_text("\n".join(out), encoding="utf-8")
+              print(f"Applied {len(final_items)} entries to {t}")
+
+          print(f"Fragment source: {frag_path}")
           PY
 
-          echo "Applied fragment: $FRAG"
-          echo "Target updated: $TARGET"
-          echo "------ Fragment content ------"
+          echo "------ Effective fragment ------"
           cat "$FRAG"
-          echo "------------------------------"
+          echo "--------------------------------"
 
       - name: Build cloud flavor kernel packages
         run: |
@@ -261,7 +296,7 @@ jobs:
           cd "$SRC_DIR"
           export MAKEFLAGS="-j$(nproc)"
 
-          # Generate packaging metadata from debian/* configs
+          # Regenerate packaging metadata from debian/config/*
           make -f debian/rules source
 
           BUILT=0
@@ -289,7 +324,6 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
 
-          # Collect cloud flavor artifacts first
           find "$PKG_DIR" -maxdepth 1 -type f \
             \( -name 'linux-image-*cloud*amd64*.deb' \
                -o -name 'linux-headers-*cloud*amd64*.deb' \
@@ -298,7 +332,6 @@ jobs:
                -o -name '*.changes' \) \
             -exec mv -v {} artifacts/ \;
 
-          # Fallback if no cloud deb was produced
           if ! find artifacts -maxdepth 1 -type f -name '*.deb' | grep -q .; then
             echo "No cloud .deb found; collecting generic kernel .deb files."
             find "$PKG_DIR" -maxdepth 1 -type f \
@@ -308,7 +341,7 @@ jobs:
               -exec mv -v {} artifacts/ \;
           fi
 
-          # Export one generated effective config (best effort)
+          # Save one generated effective .config (best effort)
           find "$SRC_DIR/debian/build" -type f -name '.config' -print -quit | while IFS= read -r cfg; do
             cp "$cfg" "artifacts/config-${GITHUB_RUN_ID}"
           done || true

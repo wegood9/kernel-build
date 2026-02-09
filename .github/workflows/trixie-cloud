@@ -1,0 +1,184 @@
+name: Debian Trixie Cloud Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Create GitHub release"
+        required: false
+        default: "true"
+      keep_releases:
+        description: "How many releases to keep"
+        required: false
+        default: "5"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    # Build inside Debian Trixie userspace
+    container:
+      image: debian:trixie
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      DEB_BUILD_OPTIONS: nocheck
+      # Reduce disk usage/time by skipping kernel debug packages
+      DEB_BUILD_PROFILES: pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo
+      DEB_RULES_REQUIRES_ROOT: "no"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show system info
+        run: |
+          uname -a
+          echo "CPU cores: $(nproc)"
+          df -h
+
+      - name: Configure APT sources (enable deb-src)
+        run: |
+          cat > /etc/apt/sources.list <<'EOF'
+          deb http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
+          deb-src http://deb.debian.org/debian trixie main contrib non-free-firmware non-free
+          deb http://deb.debian.org/debian trixie-updates main contrib non-free-firmware non-free
+          deb-src http://deb.debian.org/debian trixie-updates main contrib non-free-firmware non-free
+          deb http://security.debian.org/debian-security trixie-security main contrib non-free-firmware non-free
+          deb-src http://security.debian.org/debian-security trixie-security main contrib non-free-firmware non-free
+          EOF
+          apt-get update
+
+      - name: Install build tooling
+        run: |
+          apt-get install -y --no-install-recommends \
+            ca-certificates gnupg dirmngr \
+            build-essential fakeroot dpkg-dev devscripts equivs \
+            git rsync wget curl xz-utils zstd cpio \
+            bc bison flex libelf-dev libssl-dev libncurses-dev dwarves \
+            quilt
+          # Install Debian linux source build dependencies
+          apt-get build-dep -y linux
+
+      - name: Download Debian linux source
+        run: |
+          apt-get source linux
+          SRC_DIR="$(find . -maxdepth 1 -type d -name 'linux-*' | sort | head -n1)"
+          if [ -z "$SRC_DIR" ]; then
+            echo "ERROR: linux source directory not found."
+            exit 1
+          fi
+          echo "SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
+          echo "Source dir: $SRC_DIR"
+
+      - name: Optional local patch (if present)
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/debian-cloud.patch" ]; then
+            echo "Applying debian-cloud.patch"
+            patch -d "$SRC_DIR" -p1 < "$GITHUB_WORKSPACE/debian-cloud.patch"
+          else
+            echo "No debian-cloud.patch found, continue."
+          fi
+
+      - name: Build cloud flavor kernel packages
+        run: |
+          cd "$SRC_DIR"
+          export MAKEFLAGS="-j$(nproc)"
+
+          # Prepare generated debian build files
+          make -f debian/rules source
+
+          # Try known cloud-target names first (different package revisions can vary)
+          set +e
+          BUILT=0
+          for TARGET in \
+            binary-arch_amd64_none_cloud \
+            binary-arch_amd64_none_cloud-amd64 \
+            binary-arch_amd64_none_amd64
+          do
+            echo "Trying target: $TARGET"
+            make -f debian/rules.gen "$TARGET"
+            RC=$?
+            if [ "$RC" -eq 0 ]; then
+              BUILT=1
+              echo "BUILD_TARGET=$TARGET" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          set -e
+
+          # Fallback: architecture-dependent binaries
+          if [ "$BUILT" -ne 1 ]; then
+            echo "Cloud-only target not matched; fallback to dpkg-buildpackage -B"
+            dpkg-buildpackage -B -uc -us
+            echo "BUILD_TARGET=dpkg-buildpackage -B" >> "$GITHUB_ENV"
+          fi
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          shopt -s nullglob
+
+          # Debian builds output packages in parent directory of source tree
+          for f in \
+            linux-image-*cloud*amd64*.deb \
+            linux-headers-*cloud*amd64*.deb \
+            linux-libc-dev_*amd64*.deb \
+            *.buildinfo \
+            *.changes
+          do
+            [ -e "$f" ] && mv -v "$f" artifacts/
+          done
+
+          # If no cloud-filtered packages found, collect generic kernel debs
+          if ! ls artifacts/*.deb >/dev/null 2>&1; then
+            echo "No cloud-filtered .deb found; collecting generic linux .deb files."
+            for f in linux-image-*.deb linux-headers-*.deb linux-libc-dev_*.deb; do
+              [ -e "$f" ] && mv -v "$f" artifacts/
+            done
+          fi
+
+          # Export one generated config (best effort)
+          find "$SRC_DIR/debian/build" -type f -name '.config' -print -quit | while read -r cfg; do
+            cp "$cfg" "artifacts/config-${{ github.run_id }}"
+          done || true
+
+          ls -lah artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-trixie-cloud-kernel-${{ github.run_id }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub release
+        if: ${{ inputs.release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debian-trixie-cloud-${{ github.run_id }}
+          name: Debian Trixie Cloud Kernel (${{ env.BUILD_TARGET }})
+          files: artifacts/*
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old workflow runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 30
+          keep_minimum_runs: 5
+
+      - name: Delete old releases
+        if: always()
+        uses: dev-drprasad/delete-older-releases@master
+        with:
+          keep_latest: ${{ inputs.keep_releases }}
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

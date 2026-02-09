@@ -12,7 +12,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: debian:trixie  # Use Trixie container to ensure correct build environment
+    container: debian:trixie
     
     env:
       DEBIAN_FRONTEND: noninteractive
@@ -21,67 +21,84 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Enable Source Repositories
+        run: |
+          # The standard debian docker image has deb-src commented out.
+          # We must enable it to fetch the kernel source.
+          sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
+          cat /etc/apt/sources.list # Verify the change
+
       - name: Install Dependencies
         run: |
           apt-get update
+          # Install build dependencies for the kernel
+          apt-get build-dep -y linux
+          # Install tools needed for the workflow and packaging
           apt-get install -y build-essential fakeroot libncurses-dev bison flex libssl-dev libelf-dev \
           dwarves git bc rsync wget ca-certificates debhelper python3 kmod cpio \
-          pahole kernel-wedge
-          
-          # Install dependencies specifically for Debian kernel packaging
-          apt-get install -y linux-source
+          pahole kernel-wedge quilt
 
       - name: Fetch Debian Trixie Kernel Source
         run: |
-          echo "Cloning Debian Kernel Team source..."
-          # Clone the specific branch for Trixie (usually master or a specific codename branch)
-          git clone --depth=1 https://salsa.debian.org/kernel-team/linux.git -b master linux-src
+          echo "Fetching source via apt..."
+          # This downloads the source, unpacks it, and applies Debian patches automatically.
+          # It guarantees you get the exact kernel version intended for Trixie.
+          apt-get source linux
           
-          # Alternatively, if you want the exact upstream stable version used in Trixie:
-          # wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
-          # tar -xf linux-6.12.tar.xz
-          # mv linux-6.12 linux-src
+          # Rename the directory to a generic name for the next steps
+          mv linux-* linux-src
+          ls -lh linux-src
 
       - name: Prepare Cloud Configuration
         run: |
           cd linux-src
           
-          # Method 1: Fetch config from Debian Salsa (Official Config)
-          # Debian cloud kernels are typically standard configs with specific modules enabled/disabled
-          # We grab the 'amd64' config. In Debian, 'cloud' is often a flavor of the main image 
-          # or handled via specific fragments. Here we use the standard amd64 config as base.
-          wget -O .config https://salsa.debian.org/kernel-team/linux/-/raw/master/debian/config/amd64/config.amd64_none_amd64
+          # We base our config on the current Debian configuration.
+          # apt-get source usually includes the debian/ folder with configs.
+          # We can grab the amd64 config from the debian build directory or /boot if available.
           
-          # Explicitly set it to cloud-localversion to distinguish it
+          # However, a cleaner start for custom builds is often 'make defconfig' or using the provided debian config.
+          # Debian configs are complex (split into fragments). 
+          # Let's try to generate the standard Debian config first.
+          
+          # If debian/rules exists, we can use it to generate the config, 
+          # BUT simpler is to just fetch the stock config from the repo if 'make olddefconfig' is too basic.
+          wget -O .config https://salsa.debian.org/kernel-team/linux/-/raw/sid/debian/config/amd64/config.amd64_none_amd64
+          
+          # Set a custom local version to identify this build
           scripts/config --set-str LOCALVERSION "-cloud-custom"
           
-          # Ensure we have a valid config before customization
+          # Normalize the config
           make olddefconfig
 
       - name: Apply Custom Config (config.sh)
         run: |
           cd linux-src
           
-          # Copy config.sh from the checkout to the source dir
+          # Copy config.sh from your repo to the source dir
           cp ../config.sh .
           chmod +x config.sh
           
           echo "Applying config.sh..."
           ./config.sh
           
-          # Finalize config
+          # Finalize config again after script changes
           make olddefconfig
 
       - name: Build Kernel (Debian Package)
         run: |
           cd linux-src
           
+          # Disable debug info to save massive amounts of time and space (optional but recommended for cloud)
+          scripts/config --disable DEBUG_INFO
+          scripts/config --disable DEBUG_INFO_BTF
+          scripts/config --enable DEBUG_INFO_NONE
+          
           # Build binary packages (headers and image)
-          # -j$(nproc) uses all available cores
-          # bindeb-pkg builds the source and binary .deb packages
-          make -j$(nproc) bindeb-pkg LOCALVERSION=-cloud-custom KDEB_PKGVERSION=$(make kernelversion)-1
+          # bindeb-pkg is the upstream kernel target that builds .deb packages
+          make -j$(nproc) bindeb-pkg LOCALVERSION=-cloud-custom
 
-          # Move artifacts to a clean directory for upload
+          # Move artifacts
           mkdir -p ../build-artifacts
           mv ../*.deb ../build-artifacts/
           mv ../*.changes ../build-artifacts/ 2>/dev/null || true
@@ -92,4 +109,4 @@ jobs:
         with:
           name: debian-trixie-cloud-kernel
           path: build-artifacts/*
-          compression-level: 0 # Faster upload since .deb is already compressed
+          compression-level: 0

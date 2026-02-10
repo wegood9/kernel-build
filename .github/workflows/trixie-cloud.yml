@@ -1,7 +1,13 @@
-name: Build Debian Trixie Cloud Kernel
+name: Build Debian Trixie Cloud Kernel (no container)
 
 on:
   workflow_dispatch:
+    inputs:
+      build_official_signed:
+        description: "Also build official linux-signed-amd64 source package artifacts (separate; no config.sh)"
+        required: false
+        type: boolean
+        default: false
   push:
     paths:
       - ".github/workflows/build-debian-trixie-cloud.yml"
@@ -10,10 +16,13 @@ on:
 permissions:
   contents: read
 
+env:
+  CHROOT_DIR: /srv/trixie
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 420
 
     steps:
       - name: Checkout repository
@@ -23,85 +32,179 @@ jobs:
         run: |
           set -eux
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
-          docker system prune -af || true
+          sudo apt-get clean || true
           df -h
 
-      - name: Build Debian trixie cloud kernel in container
+      - name: Install host prerequisites
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap ca-certificates
+
+      - name: Bootstrap Debian trixie chroot
         run: |
           set -euxo pipefail
-          chmod +x config.sh
+          sudo mkdir -p "${CHROOT_DIR}"
+          sudo debootstrap --variant=minbase trixie "${CHROOT_DIR}" http://deb.debian.org/debian
 
-          docker run --rm \
-            -e DEBIAN_FRONTEND=noninteractive \
-            -v "$GITHUB_WORKSPACE:/work" \
-            -w /work \
-            debian:trixie \
-            bash -euxo pipefail -c '
-              # Ensure official Debian trixie repos (binary + source)
-              cat > /etc/apt/sources.list <<EOF
-              deb http://deb.debian.org/debian trixie main
-              deb-src http://deb.debian.org/debian trixie main
-              EOF
+          # Need deb-src for build-dep / apt source
+          sudo tee "${CHROOT_DIR}/etc/apt/sources.list" >/dev/null <<'EOF'
+          deb http://deb.debian.org/debian trixie main
+          deb-src http://deb.debian.org/debian trixie main
+          EOF
 
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                ca-certificates \
-                build-essential fakeroot devscripts dpkg-dev \
-                bc bison flex kmod cpio rsync file git \
-                xz-utils zstd quilt python3 \
-                libelf-dev libssl-dev libncurses-dev dwarves
+          # Bind mounts for chroot operation + workspace access
+          sudo mkdir -p "${CHROOT_DIR}/proc" "${CHROOT_DIR}/sys" "${CHROOT_DIR}/dev/pts" "${CHROOT_DIR}/work"
+          sudo mount -t proc proc "${CHROOT_DIR}/proc"
+          sudo mount -t sysfs sys "${CHROOT_DIR}/sys"
+          sudo mount --bind /dev "${CHROOT_DIR}/dev"
+          sudo mount --bind /dev/pts "${CHROOT_DIR}/dev/pts"
+          sudo mount --bind "$GITHUB_WORKSPACE" "${CHROOT_DIR}/work"
 
-              # Install Debian kernel build dependencies and fetch official Debian source
-              apt-get build-dep -y linux
-              apt-get source linux
+      - name: Build custom cloud kernel + optional official signed artifacts
+        env:
+          BUILD_OFFICIAL_SIGNED: ${{ github.event.inputs.build_official_signed || 'false' }}
+        run: |
+          set -euxo pipefail
+          chmod +x config.sh || true
 
-              SRC_DIR="$(find . -maxdepth 1 -type d -name "linux-*" | sort | head -n1)"
-              test -n "$SRC_DIR"
-              cd "$SRC_DIR"
+          sudo --preserve-env=BUILD_OFFICIAL_SIGNED chroot "${CHROOT_DIR}" /bin/bash <<'CHROOT'
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
 
-              export DEB_RULES_REQUIRES_ROOT=no
-              export DEB_BUILD_PROFILES="pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo"
-              export MAKEFLAGS="-j$(nproc)"
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential fakeroot devscripts dpkg-dev debhelper \
+            bc bison flex kmod cpio rsync file git \
+            xz-utils zstd quilt python3 \
+            libelf-dev libssl-dev libncurses-dev dwarves \
+            equivs
 
-              ARCH=amd64
-              FEATURESET=none
-              FLAVOUR=cloud
-              SETUP_TARGET="setup_${ARCH}_${FEATURESET}_${FLAVOUR}"
-              BUILD_TARGET="binary-arch_${ARCH}_${FEATURESET}_${FLAVOUR}"
-              BUILD_DIR="debian/build/build_${ARCH}_${FEATURESET}_${FLAVOUR}"
+          # -------- Custom build from official Debian linux source --------
+          apt-get build-dep -y linux
 
-              # Prepare Debian patched source and cloud flavour config
-              debian/rules source
-              make -f debian/rules.gen "${SETUP_TARGET}"
+          mkdir -p /work/build /work/out/custom /work/out/official-signed
+          cd /work/build
 
-              # Apply your repo config.sh exactly like the original repo flow idea
-              cp "${BUILD_DIR}/.config" .config
-              bash /work/config.sh
-              cp .config "${BUILD_DIR}/.config"
+          apt-get source linux
+          SRC_DIR="$(find . -maxdepth 1 -type d -name 'linux-*' | sort -V | tail -n1)"
+          test -n "${SRC_DIR}"
+          cd "${SRC_DIR}"
 
-              # Resolve any new symbols after config tweaks
-              make O="${BUILD_DIR}" olddefconfig
+          export MAKEFLAGS="-j$(nproc)"
+          export DEB_RULES_REQUIRES_ROOT=no
+          # reduce space/time
+          export DEB_BUILD_PROFILES="pkg.linux.nokerneldbg pkg.linux.nokerneldbginfo"
 
-              # Build only cloud flavour packages
-              make -f debian/rules.gen "${BUILD_TARGET}"
+          ARCH=amd64
+          FEATURESET=none
+          FLAVOUR=cloud
+          BUILD_DIR="debian/build/build_${ARCH}_${FEATURESET}_${FLAVOUR}"
 
-              # Optional: build indep common headers package (ignore failure if not needed)
-              make -f debian/rules.gen binary-indep_none || true
+          debian/rules source
+          make -f debian/rules.gen "setup_${ARCH}_${FEATURESET}_${FLAVOUR}"
 
-              # Copy outputs back to workspace root
-              cp -vf ../*.deb /work/ || true
-              cp -vf ../*.changes /work/ || true
-              cp -vf ../*.buildinfo /work/ || true
-            '
+          # Apply repo config.sh on top of flavour config
+          cp "${BUILD_DIR}/.config" .config
+          bash /work/config.sh
+          cp .config "${BUILD_DIR}/.config"
 
-      - name: Upload build artifacts
+          # Fill any new symbols introduced by config changes
+          make -C "${BUILD_DIR}" olddefconfig
+
+          # Build only cloud flavour + indep common headers metadata
+          make -f debian/rules.gen "binary-arch_${ARCH}_${FEATURESET}_${FLAVOUR}"
+          make -f debian/rules.gen "binary-indep_${FEATURESET}" || true
+
+          cd /work/build
+
+          # Copy custom artifacts
+          find . -maxdepth 1 -type f \( -name '*.deb' -o -name '*.changes' -o -name '*.buildinfo' -o -name '*.dsc' \) \
+            -exec cp -vf {} /work/out/custom/ \; || true
+          cp -vf "${SRC_DIR}/${BUILD_DIR}/.config" /work/out/custom/cloud-amd64.final.config || true
+
+          # Create local meta packages (cloud-amd64 style) that depend on built binaries
+          IMG_DEB="$(ls -1 /work/out/custom/linux-image-*cloud-amd64*.deb 2>/dev/null | grep -Ev 'dbgsym|dbg' | head -n1 || true)"
+          HDR_DEB="$(ls -1 /work/out/custom/linux-headers-*cloud-amd64*.deb 2>/dev/null | grep -Ev 'dbgsym|dbg' | head -n1 || true)"
+          COM_DEB="$(ls -1 /work/out/custom/linux-headers-*common*.deb 2>/dev/null | grep -Ev 'dbgsym|dbg' | head -n1 || true)"
+
+          if [ -n "${IMG_DEB}" ]; then
+            IMG_PKG="$(dpkg-deb -f "${IMG_DEB}" Package)"
+            cat > /tmp/linux-image-cloud-amd64-custom.control <<EOF
+          Section: misc
+          Priority: optional
+          Standards-Version: 4.6.0
+          Package: linux-image-cloud-amd64-custom
+          Version: 1.0
+          Maintainer: CI Builder <ci@example.invalid>
+          Depends: ${IMG_PKG}
+          Architecture: all
+          Description: Custom cloud kernel metapackage (depends on CI-built image)
+           Local metapackage generated in CI.
+          EOF
+            equivs-build /tmp/linux-image-cloud-amd64-custom.control
+            cp -vf /tmp/linux-image-cloud-amd64-custom_*_all.deb /work/out/custom/ || true
+          fi
+
+          if [ -n "${HDR_DEB}" ]; then
+            HDR_PKG="$(dpkg-deb -f "${HDR_DEB}" Package)"
+            DEP_LINE="${HDR_PKG}"
+            if [ -n "${COM_DEB}" ]; then
+              COM_PKG="$(dpkg-deb -f "${COM_DEB}" Package)"
+              DEP_LINE="${DEP_LINE}, ${COM_PKG}"
+            fi
+
+            cat > /tmp/linux-headers-cloud-amd64-custom.control <<EOF
+          Section: misc
+          Priority: optional
+          Standards-Version: 4.6.0
+          Package: linux-headers-cloud-amd64-custom
+          Version: 1.0
+          Maintainer: CI Builder <ci@example.invalid>
+          Depends: ${DEP_LINE}
+          Architecture: all
+          Description: Custom cloud headers metapackage (depends on CI-built headers)
+           Local metapackage generated in CI.
+          EOF
+            equivs-build /tmp/linux-headers-cloud-amd64-custom.control
+            cp -vf /tmp/linux-headers-cloud-amd64-custom_*_all.deb /work/out/custom/ || true
+          fi
+
+          # -------- Optional: official signed source package build --------
+          if [ "${BUILD_OFFICIAL_SIGNED}" = "true" ]; then
+            apt-get build-dep -y linux-signed-amd64 || true
+            cd /work/build
+            apt-get source linux-signed-amd64 || true
+
+            SSRC_DIR="$(find . -maxdepth 1 -type d -name 'linux-signed-amd64-*' | sort -V | tail -n1 || true)"
+            if [ -n "${SSRC_DIR}" ]; then
+              cd "${SSRC_DIR}"
+              dpkg-buildpackage -b -uc -us || true
+              cd /work/build
+              find . -maxdepth 1 -type f \( -name '*.deb' -o -name '*.changes' -o -name '*.buildinfo' -o -name '*.dsc' \) \
+                -exec cp -vf {} /work/out/official-signed/ \; || true
+            fi
+          fi
+          CHROOT
+
+      - name: Unmount chroot mounts
+        if: always()
+        run: |
+          set -eux
+          sudo umount "${CHROOT_DIR}/work" || true
+          sudo umount "${CHROOT_DIR}/dev/pts" || true
+          sudo umount "${CHROOT_DIR}/dev" || true
+          sudo umount "${CHROOT_DIR}/sys" || true
+          sudo umount "${CHROOT_DIR}/proc" || true
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: debian-trixie-cloud-kernel
           path: |
-            *.deb
-            *.changes
-            *.buildinfo
-            linux-*/debian/build/build_amd64_none_cloud/.config
+            out/custom/*
+            out/official-signed/*
           if-no-files-found: warn
